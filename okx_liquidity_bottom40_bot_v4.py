@@ -95,6 +95,15 @@ SLIPPAGE_BPS_EXIT = float(os.getenv("SLIPPAGE_BPS_EXIT", "2"))
 SIGNAL_SOURCES = [s.strip().lower() for s in os.getenv("SIGNAL_SOURCES", "swap").split(",") if s.strip()]
 MAP_SPOT_TO_SWAP = os.getenv("MAP_SPOT_TO_SWAP", "true").lower() in ("1", "true", "yes")
 
+# التحويلات على السلاسل (Transfers)
+ENABLE_TRANSFERS = os.getenv("ENABLE_TRANSFERS", "false").lower() in ("1", "true", "yes")
+TRANSFERS_MIN_USD = float(os.getenv("TRANSFERS_MIN_USD", "1000000"))
+TRANSFERS_POLL_SEC = float(os.getenv("TRANSFERS_POLL_SEC", "1"))
+TRANSFERS_EXCHANGES = [s.strip().lower() for s in os.getenv("TRANSFERS_EXCHANGES", "").split(",") if s.strip()]
+TRANSFERS_PROVIDER = os.getenv("TRANSFERS_PROVIDER", "whalealert").lower()
+WHALE_ALERT_API_KEY = os.getenv("WHALE_ALERT_API_KEY", "")
+TRANSFERS_EXCHANGES_SET = set(TRANSFERS_EXCHANGES)
+
 # downsizing
 ALLOW_AUTO_DOWNSIZE = os.getenv("ALLOW_AUTO_DOWNSIZE", "true").lower() in ("1", "true", "yes")
 MARGIN_SAFETY_FACTOR = float(os.getenv("MARGIN_SAFETY_FACTOR", "1.05"))
@@ -139,6 +148,16 @@ class Position:
     notional: float
     tp_price: float
     sl_price: float
+
+
+@dataclass
+class TransferEvent:
+    id: str
+    base: str
+    usd: float
+    ts: int
+    src: str
+    dst: str
 
 class State:
     def __init__(self):
@@ -215,6 +234,41 @@ def _quote_volume_usd(t: dict) -> float:
         return base * last
     except Exception:
         return 0.0
+
+
+class WhaleAlertPoller:
+    BASE_URL = "https://api.whale-alert.io/v1/transactions"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def fetch_recent_transfers(self, since_ts: int) -> List[TransferEvent]:
+        if not self.api_key:
+            logger.warning("WhaleAlert API key missing; returning no transfers")
+            return []
+        params = {"api_key": self.api_key, "start": since_ts}
+        try:
+            resp = await asyncio.to_thread(requests.get, self.BASE_URL, params=params, timeout=10)
+            data = resp.json()
+            events: List[TransferEvent] = []
+            for tx in data.get("transactions", []):
+                try:
+                    events.append(
+                        TransferEvent(
+                            id=str(tx.get("id") or tx.get("hash")),
+                            base=(tx.get("symbol") or "").upper(),
+                            usd=float(tx.get("amount_usd") or 0.0),
+                            ts=int(tx.get("timestamp") or 0),
+                            src=(tx.get("from", {}) or {}).get("owner", "").lower(),
+                            dst=(tx.get("to", {}) or {}).get("owner", "").lower(),
+                        )
+                    )
+                except Exception:
+                    continue
+            return events
+        except Exception as e:
+            logger.warning(f"WhaleAlert fetch failed: {e}")
+            return []
 
 async def build_universe_bottomN() -> Tuple[List[Tuple[str, str, float]], List[Tuple[str, str, float]]]:
     """
@@ -468,10 +522,6 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
     # رسالة بعد تحرير القفل
     trigger_text = ""
     if trigger:
-        t_side = 'BUY' if trigger.get('side') == 'buy' else 'SELL'
-        t_notional = trigger.get('notional', 0)
-        t_px = trigger.get('px')
-        t_sz = trigger.get('sz')
         t_ts = trigger.get('ts')
         src = trigger.get('source', 'SWAP')
         reason_ar = (
@@ -479,14 +529,29 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
             if trigger.get('side') == 'buy'
             else "السبب: خروج/بيع ≥ 500,000$ من السوق."
         )
-        trigger_text = (
-            "📣 *Signal*\n"
-            f"مصدر الإشارة: {src.upper()}\n"
-            f"{reason_ar}\n"
-            f"• Cause: Aggressive {t_side} ≥ ${BIG_TRADE_USD:,}\n"
-            f"• Observed: {t_side} sz={t_sz} @ {t_px} → notional ≈ ${t_notional:,.0f}\n"
-            f"• Time: {t_ts}"
-        )
+        if src.upper() == 'TRANSFER':
+            direction = trigger.get('dir', '')
+            usd_val = trigger.get('usd', 0)
+            exch = trigger.get('exchange', '')
+            trigger_text = (
+                "📣 *Signal*\n"
+                f"مصدر الإشارة: TRANSFER ({direction}) {exch} ~${usd_val:,.0f}\n"
+                f"{reason_ar}\n"
+                f"• Time: {t_ts}"
+            )
+        else:
+            t_side = 'BUY' if trigger.get('side') == 'buy' else 'SELL'
+            t_notional = trigger.get('notional', 0)
+            t_px = trigger.get('px')
+            t_sz = trigger.get('sz')
+            trigger_text = (
+                "📣 *Signal*\n"
+                f"مصدر الإشارة: {src.upper()}\n"
+                f"{reason_ar}\n"
+                f"• Cause: Aggressive {t_side} ≥ ${BIG_TRADE_USD:,}\n"
+                f"• Observed: {t_side} sz={t_sz} @ {t_px} → notional ≈ ${t_notional:,.0f}\n"
+                f"• Time: {t_ts}"
+            )
 
     exec_text = (
         f"🟢 *Opened {side.upper()}* `{inst_id}`\n"
@@ -607,6 +672,67 @@ async def hourly_report_loop():
             logger.error(f"Hourly report error: {e}")
         finally:
             await asyncio.sleep(HOURLY_REPORT_SEC)
+
+
+async def transfers_listener():
+    poller = WhaleAlertPoller(WHALE_ALERT_API_KEY)
+    since = int(time.time()) - 60
+    seen: Dict[str, float] = {}
+    while True:
+        try:
+            events = await poller.fetch_recent_transfers(since)
+            since = int(time.time()) - 60
+            now = time.time()
+            for k, v in list(seen.items()):
+                if now - v > 60:
+                    del seen[k]
+            for ev in events:
+                if ev.id in seen:
+                    continue
+                seen[ev.id] = now
+                usd = ev.usd
+                if usd < TRANSFERS_MIN_USD:
+                    continue
+                direction = None
+                exchange_name = None
+                if ev.dst in TRANSFERS_EXCHANGES_SET:
+                    direction = "inflow"
+                    exchange_name = ev.dst
+                elif ev.src in TRANSFERS_EXCHANGES_SET:
+                    direction = "outflow"
+                    exchange_name = ev.src
+                if not direction:
+                    continue
+                base = ev.base.upper()
+                inst_id = state.swap_map.get(base)
+                if not inst_id:
+                    continue
+                ts_int = int(ev.ts)
+                last_ts = state.last_signal_ts_by_inst.get(inst_id, 0)
+                if ts_int and ts_int == last_ts:
+                    continue
+                if ts_int:
+                    state.last_signal_ts_by_inst[inst_id] = ts_int
+                side = "short" if direction == "inflow" else "long"
+                eff_lev = get_effective_leverage(state.mk[inst_id]["symbol"])
+                notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
+                trigger = {
+                    "source": "TRANSFER",
+                    "dir": direction,
+                    "usd": usd,
+                    "ts": ev.ts,
+                    "exchange": exchange_name,
+                    "side": "sell" if side == "short" else "buy",
+                }
+                if state.position is None:
+                    await open_position(inst_id, side, notional_to_use, trigger)
+                else:
+                    if FLIP_ALLOWED and state.position.inst_id == inst_id and side != state.position.side:
+                        await close_position("flip")
+                        await open_position(inst_id, side, notional_to_use, trigger)
+        except Exception as e:
+            logger.error(f"Transfers poller error: {e}")
+        await asyncio.sleep(TRANSFERS_POLL_SEC)
 
 # ==========================
 # WebSocket للـ Bottom-N
@@ -746,6 +872,8 @@ async def main():
         asyncio.create_task(trades_listener()),
         asyncio.create_task(hourly_report_loop()),
     ]
+    if ENABLE_TRANSFERS and "transfers" in SIGNAL_SOURCES:
+        tasks.append(asyncio.create_task(transfers_listener()))
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
