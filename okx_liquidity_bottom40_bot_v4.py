@@ -91,6 +91,10 @@ TAKER_FEE_BPS_PER_SIDE = float(os.getenv("TAKER_FEE_BPS_PER_SIDE", "5"))
 SLIPPAGE_BPS_ENTRY = float(os.getenv("SLIPPAGE_BPS_ENTRY", "2"))
 SLIPPAGE_BPS_EXIT = float(os.getenv("SLIPPAGE_BPS_EXIT", "2"))
 
+# مصادر الإشارات وخرائط السبوت→السواب
+SIGNAL_SOURCES = [s.strip().lower() for s in os.getenv("SIGNAL_SOURCES", "swap").split(",") if s.strip()]
+MAP_SPOT_TO_SWAP = os.getenv("MAP_SPOT_TO_SWAP", "true").lower() in ("1", "true", "yes")
+
 # downsizing
 ALLOW_AUTO_DOWNSIZE = os.getenv("ALLOW_AUTO_DOWNSIZE", "true").lower() in ("1", "true", "yes")
 MARGIN_SAFETY_FACTOR = float(os.getenv("MARGIN_SAFETY_FACTOR", "1.05"))
@@ -148,7 +152,10 @@ class State:
         self.losing_trades: int = 0
         # معلومات السوق لكل أداة: contractSize, amount_min, amount_precision
         self.mk: Dict[str, dict] = {}
-        self.watch_insts: List[str] = []
+        self.watch_insts: List[str] = []      # swap instIds
+        self.watch_spot_insts: List[str] = [] # spot instIds
+        self.spot_map: Dict[str, str] = {}    # base -> spot instId
+        self.swap_map: Dict[str, str] = {}    # base -> swap instId
         self.last_signal_ts_by_inst: Dict[str, int] = {}
         self.effective_leverage_by_symbol: Dict[str, int] = {}
 
@@ -209,58 +216,73 @@ def _quote_volume_usd(t: dict) -> float:
     except Exception:
         return 0.0
 
-async def build_universe_bottomN() -> List[Tuple[str, str, float]]:
+async def build_universe_bottomN() -> Tuple[List[Tuple[str, str, float]], List[Tuple[str, str, float]]]:
     """
-    يبني قائمة Bottom-N تلقائيًا من أسواق USDT-SWAP (linear) حسب *أقل* حجم تداول بالدولار.
-    يعيد قائمة [(instId, symbol, vol_quote_usd), ...] بترتيب تصاعدي (الأقل أولًا).
-    يطبق حدًا أدنى MIN_QUOTE_VOL_USD لضمان "فيها سيولة".
+    يبني قائمة Bottom-N تلقائيًا من أسواق USDT-SWAP مع إمكانية ربط SPOT المقابل.
+    يعيد قائمتين: [ (swap_instId, swap_symbol, vol), ... ] و [ (spot_instId, spot_symbol, vol), ... ].
     """
     await asyncio.to_thread(exchange.load_markets)
-    # جميع أسواق USDT-SWAP الخطية
-    insts: List[Tuple[str, str]] = []
+
+    bases: Dict[str, dict] = {}
     for m in exchange.markets.values():
         try:
             if m.get("type") == "swap" and m.get("quote") == "USDT" and m.get("linear"):
+                base = m.get("base")
                 inst_id = m.get("id")
                 sym = m.get("symbol")
-                if inst_id and sym:
-                    insts.append((inst_id, sym))
+                if base and inst_id and sym:
+                    info = bases.setdefault(base, {})
+                    info["swap_inst"] = inst_id
+                    info["swap_symbol"] = sym
+                    spot_symbol = f"{base}/USDT"
+                    spot_m = exchange.markets.get(spot_symbol)
+                    if spot_m:
+                        info["spot_inst"] = spot_m.get("id")
+                        info["spot_symbol"] = spot_symbol
         except Exception:
             continue
 
-    if not insts:
-        return []
+    if not bases:
+        return [], []
 
-    scored: List[Tuple[float, str, str]] = []
+    swap_symbols = [info["swap_symbol"] for info in bases.values()]
+    spot_symbols = [info["spot_symbol"] for info in bases.values() if "spot_symbol" in info]
     try:
-        symbols = [sym for _, sym in insts]
-        tickers = await asyncio.to_thread(exchange.fetch_tickers, symbols)
-        for inst_id, sym in insts:
-            t = tickers.get(sym, {}) or {}
-            vol_quote = _quote_volume_usd(t)
-            scored.append((vol_quote, inst_id, sym))
-        # ترتيب تصاعدي (الأدنى أولًا)
-        scored.sort(key=lambda x: x[0])
-
-        # أولًا: المرشحون الذين >= حد السيولة
-        filtered = [(inst, sym, v) for (v, inst, sym) in scored if v >= MIN_QUOTE_VOL_USD]
-        if len(filtered) >= TOP_N:
-            selected = filtered[:TOP_N]
-        else:
-            # لو قليلين فوق الحد، نكمل من الباقي (فوق صفر) حتى نصل TOP_N
-            remainder = [(inst, sym, v) for (v, inst, sym) in scored if v > 0 and (inst, sym, v) not in filtered]
-            needed = TOP_N - len(filtered)
-            selected = filtered + remainder[:max(0, needed)]
-
-        # في حالة لم نصل TOP_N لأي سبب (demo)، خذ أول TOP_N عمومًا
-        if len(selected) < TOP_N:
-            selected = [(inst, sym, v) for (v, inst, sym) in scored[:TOP_N]]
-
+        tickers = await asyncio.to_thread(exchange.fetch_tickers, swap_symbols + spot_symbols)
     except Exception as e:
-        logger.warning(f"fetch_tickers failed ({e}); falling back to arbitrary first {TOP_N} USDT-SWAP markets.")
-        selected = [(inst, sym, 0.0) for inst, sym in insts[:TOP_N]]
+        logger.warning(f"fetch_tickers failed ({e}); using zeros for volumes")
+        tickers = {}
 
-    return selected
+    scored: List[Tuple[float, str, dict]] = []
+    for base, info in bases.items():
+        vol_swap = _quote_volume_usd(tickers.get(info["swap_symbol"], {}))
+        vol_spot = _quote_volume_usd(tickers.get(info.get("spot_symbol", ""), {}))
+        total = vol_swap + vol_spot
+        scored.append((total, base, info))
+    scored.sort(key=lambda x: x[0])
+
+    filtered = [(base, info, vol) for (vol, base, info) in scored if vol >= MIN_QUOTE_VOL_USD]
+    if len(filtered) >= TOP_N:
+        chosen = filtered[:TOP_N]
+    else:
+        remainder = [(base, info, vol) for (vol, base, info) in scored if (base, info, vol) not in filtered and vol > 0]
+        needed = TOP_N - len(filtered)
+        chosen = filtered + remainder[:max(0, needed)]
+    if len(chosen) < TOP_N:
+        chosen = [(base, info, vol) for (vol, base, info) in scored[:TOP_N]]
+
+    selected_swap: List[Tuple[str, str, float]] = []
+    selected_spot: List[Tuple[str, str, float]] = []
+    state.spot_map.clear()
+    state.swap_map.clear()
+    for base, info, vol in chosen:
+        selected_swap.append((info["swap_inst"], info["swap_symbol"], vol))
+        state.swap_map[base] = info["swap_inst"]
+        if info.get("spot_inst") and info.get("spot_symbol"):
+            selected_spot.append((info["spot_inst"], info["spot_symbol"], vol))
+            state.spot_map[base] = info["spot_inst"]
+
+    return selected_swap, selected_spot
 
 async def ensure_markets(selected: List[Tuple[str, str, float]]):
     """
@@ -451,6 +473,7 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         t_px = trigger.get('px')
         t_sz = trigger.get('sz')
         t_ts = trigger.get('ts')
+        src = trigger.get('source', 'SWAP')
         reason_ar = (
             "السبب: دخول مستثمر/متداول بشراء ≥ 500,000$."
             if trigger.get('side') == 'buy'
@@ -458,6 +481,7 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         )
         trigger_text = (
             "📣 *Signal*\n"
+            f"مصدر الإشارة: {src.upper()}\n"
             f"{reason_ar}\n"
             f"• Cause: Aggressive {t_side} ≥ ${BIG_TRADE_USD:,}\n"
             f"• Observed: {t_side} sz={t_sz} @ {t_px} → notional ≈ ${t_notional:,.0f}\n"
@@ -595,6 +619,8 @@ async def trades_listener():
 
     while True:
         args = [{"channel": "trades", "instId": inst} for inst in state.watch_insts]
+        if "spot" in SIGNAL_SOURCES:
+            args.extend([{"channel": "trades", "instId": inst} for inst in state.watch_spot_insts])
         if not args:
             await asyncio.sleep(2)
             continue
@@ -634,30 +660,42 @@ async def trades_listener():
                         if notional < BIG_TRADE_USD:
                             continue
 
-                        # إزالة الازدواجية لنفس الطابع الزمني على نفس الأداة
+                        if inst in state.watch_insts:
+                            source = "SWAP"
+                            target_inst = inst
+                        else:
+                            source = "SPOT"
+                            if not MAP_SPOT_TO_SWAP:
+                                continue
+                            base = inst.split('-')[0]
+                            target_inst = state.swap_map.get(base)
+                            if not target_inst:
+                                continue
+
+                        # إزالة الازدواجية لنفس الطابع الزمني على الأداة المنفذة
                         try:
                             ts_int = int(ts) if ts else 0
-                            last_ts = state.last_signal_ts_by_inst.get(inst, 0)
+                            last_ts = state.last_signal_ts_by_inst.get(target_inst, 0)
                             if ts_int and ts_int == last_ts:
                                 continue
                             if ts_int:
-                                state.last_signal_ts_by_inst[inst] = ts_int
+                                state.last_signal_ts_by_inst[target_inst] = ts_int
                         except Exception:
                             pass
 
                         signal_side = "long" if side == "buy" else "short"
-                        trigger = {"side": side, "px": px, "sz": sz, "notional": notional, "ts": ts}
+                        trigger = {"side": side, "px": px, "sz": sz, "notional": notional, "ts": ts, "source": source}
 
                         if state.position is None:
-                            eff_lev = get_effective_leverage(state.mk[inst]["symbol"])
+                            eff_lev = get_effective_leverage(state.mk[target_inst]["symbol"])
                             notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
-                            await open_position(inst, signal_side, notional_to_use, trigger)
+                            await open_position(target_inst, signal_side, notional_to_use, trigger)
                         else:
-                            if FLIP_ALLOWED and state.position.inst_id == inst and signal_side != state.position.side:
+                            if FLIP_ALLOWED and state.position.inst_id == target_inst and signal_side != state.position.side:
                                 await close_position("flip")
-                                eff_lev = get_effective_leverage(state.mk[inst]["symbol"])
+                                eff_lev = get_effective_leverage(state.mk[target_inst]["symbol"])
                                 notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
-                                await open_position(inst, signal_side, notional_to_use, trigger)
+                                await open_position(target_inst, signal_side, notional_to_use, trigger)
         except Exception as e:
             logger.error(f"WS error: {e}. Reconnecting in 0.6s…")
             await asyncio.sleep(0.6)
@@ -670,14 +708,15 @@ async def main():
         logger.error("OKX API credentials missing. Set them in .env or directly in the file.")
         return
 
-    # بناء قائمة "Bottom-N مع سيولة دنيا"
-    selected = await build_universe_bottomN()
-    state.watch_insts = [inst for inst, sym, vol in selected]
+    # بناء قائمة "Bottom-N مع سيولة دنيا" مع ربط السبوت
+    selected_swap, selected_spot = await build_universe_bottomN()
+    state.watch_insts = [inst for inst, sym, vol in selected_swap]
+    state.watch_spot_insts = [inst for inst, sym, vol in selected_spot]
     if len(state.watch_insts) < TOP_N:
         logger.warning(f"Available instruments: {len(state.watch_insts)} < desired TOP_N={TOP_N} (Demo قد لا يدعم كل الأزواج).")
 
-    # تحميل الميتاداتا للأسواق المختارة
-    await ensure_markets(selected)
+    # تحميل الميتاداتا للأسواق المختارة (swap + spot)
+    await ensure_markets(selected_swap + selected_spot)
 
     # ضبط الرافعة بأسلوب تكيفي
     for inst in state.watch_insts:
