@@ -7,7 +7,7 @@
 - حجم الدخول ثابت: **100$ مارجن × 10x = 1000$** اسمي لكل صفقة. صفقة واحدة فقط + Flip على نفس الأداة.
 - الهدف/الوقف: **صافي ±2%** من سعر الدخول بعد الرسوم والانزلاق.
 - تيليجرام منظم: رسالة بدء، رسالة فتح تجمع سبب الإشارة + تفاصيل التنفيذ، تقرير كل ساعة، رسالة إغلاق بنتيجة الربح/الخسارة.
-- تحسينات: قفل تزامني لمنع السباقات، اشتراكات WS على دفعات، وضبط رافعة مع backoff.
+ - تحسينات: قفل تزامني لمنع السباقات، اشتراكات WS على دفعات، وضبط رافعة تكيفية.
 
 المتطلبات
 ---------
@@ -282,25 +282,34 @@ async def ensure_markets(selected: List[Tuple[str, str, float]]):
         }
         logger.info(f"{inst} -> symbol={symbol}, contractSize={state.mk[inst]['contractSize']}, quoteVol≈${vol:,.0f}")
 
-async def set_leverage_with_backoff(symbol: str, leverage: int):
+async def set_leverage_adaptive(symbol: str, target: int) -> int:
     if not hasattr(exchange, "set_leverage"):
-        return
+        state.effective_leverage_by_symbol[symbol] = 1
+        return 1
+    candidates = [target]
+    for x in (7, 5, 3, 2, 1):
+        if x not in candidates:
+            candidates.append(x)
     delay = 0.4
-    for attempt in range(5):
+    for lev in candidates:
         try:
-            await asyncio.to_thread(exchange.set_leverage, leverage, symbol, {"mgnMode": "cross"})
-            logger.info(f"Leverage set to {leverage}x for {symbol}")
-            state.effective_leverage_by_symbol[symbol] = leverage
-            return leverage
+            await asyncio.to_thread(exchange.set_leverage, lev, symbol, {"mgnMode": "cross"})
+            logger.info(f"Leverage set to {lev}x for {symbol}")
+            state.effective_leverage_by_symbol[symbol] = lev
+            return lev
         except Exception as e:
             s = str(e)
-            if "50011" in s or "Too Many Requests" in s:
+            if "Too Many Requests" in s or "50011" in s:
                 logger.warning(f"Rate limited on set_leverage for {symbol}. retry in {delay:.1f}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 4.0)
                 continue
-            logger.warning(f"Couldn't set leverage via API for {symbol}: {e}")
-            return None
+            logger.warning(f"Leverage {lev}x not allowed on {symbol}; trying lower...")
+            await asyncio.sleep(0.05)
+            continue
+    logger.warning(f"All leverage attempts failed for {symbol}; defaulting to 1x.")
+    state.effective_leverage_by_symbol[symbol] = 1
+    return 1
 
 async def fetch_price(symbol: str) -> float:
     ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
@@ -313,9 +322,7 @@ async def fetch_equity_usdt() -> float:
 
 def get_effective_leverage(symbol: str) -> int:
     lev = state.effective_leverage_by_symbol.get(symbol)
-    if lev is None or lev <= 0:
-        return max(1, LEVERAGE)
-    return max(1, lev)
+    return max(1, int(lev or 1))
 
 def notional_to_contracts(inst_id: str, notional_usd: float, price: float) -> float:
     mk = state.mk.get(inst_id)
@@ -672,12 +679,12 @@ async def main():
     # تحميل الميتاداتا للأسواق المختارة
     await ensure_markets(selected)
 
-    # ضبط الرافعة مع backoff
+    # ضبط الرافعة بأسلوب تكيفي
     for inst in state.watch_insts:
         symbol = state.mk.get(inst, {}).get("symbol")
         if symbol:
-            await set_leverage_with_backoff(symbol, LEVERAGE)
-            await asyncio.sleep(0.05)  # تأخير خفيف لتقليل الضغط
+            await set_leverage_adaptive(symbol, LEVERAGE)
+            await asyncio.sleep(0.05)
 
     # رسالة بدء
     listed = ", ".join(state.watch_insts[:10]) + ("..." if len(state.watch_insts) > 10 else "")
@@ -686,7 +693,8 @@ async def main():
         f"• Environment: {'Demo' if USE_DEMO else 'Live'}\n"
         f"• Watching (bottom): {len(state.watch_insts)} instruments (target {TOP_N})\n"
         f"• Min quote vol: ${int(MIN_QUOTE_VOL_USD):,}\n"
-        f"• Entry per trade: ${MARGIN_PER_TRADE_USD} x{LEVERAGE} = ${int(MARGIN_PER_TRADE_USD*LEVERAGE)} notional\n"
+        f"• Entry per trade: margin ${MARGIN_PER_TRADE_USD} (effective lev per symbol up to {LEVERAGE}x)\n"
+        f"• Leverage varies by symbol (adaptive)\n"
         f"• Signal threshold: ≥ ${int(BIG_TRADE_USD):,}\n"
         f"• TP/SL: ±{TAKE_PROFIT_NET_BPS/100:.2f}% net\n"
         f"• Flip: {'Enabled' if FLIP_ALLOWED else 'Disabled'}\n"
