@@ -3,7 +3,7 @@
 - هذا السكربت تعليمي فقط. التداول بالعقود الآجلة والرافعة المالية عالي المخاطر. اختبر على حساب Demo أولًا.
 - يعمل على **OKX** (Demo افتراضيًا)، ويراقب **أقل 40 زوجًا** سيولةً (Bottom-40) من USDT-SWAP بشرط ألا تكون السيولة معدومة.
 - معيار الاختيار: أصغر *quoteVolume* بالدولار (أو baseVolume*last كfallback) مع حد أدنى سيولة لضمان أنها "فيها سيولة".
-- الدخول **فوري** عند تنفيذ Aggressive بقيمة **≥ 500,000$** (قابلة للتغيير).
+- الدخول **فوري** عند تنفيذ Aggressive بقيمة **≥ 1,000,000$** (قابلة للتغيير).
 - حجم الدخول ثابت: **100$ مارجن × 10x = 1000$** اسمي لكل صفقة. صفقة واحدة فقط + Flip على نفس الأداة.
 - الهدف/الوقف: **صافي ±2%** من سعر الدخول بعد الرسوم والانزلاق.
 - تيليجرام منظم: رسالة بدء، رسالة فتح تجمع سبب الإشارة + تفاصيل التنفيذ، تقرير كل ساعة، رسالة إغلاق بنتيجة الربح/الخسارة.
@@ -23,7 +23,7 @@ TELEGRAM_CHAT_ID=1266351161
 USE_DEMO=true
 
 # شرط الإشارة
-BIG_TRADE_USD=500000
+BIG_TRADE_USD=1000000
 
 # إدارة حجم الصفقة
 MARGIN_PER_TRADE_USD=100
@@ -44,6 +44,10 @@ FLIP_ALLOWED=true
 TOP_N=40
 MIN_QUOTE_VOL_USD=1000000   # الحد الأدنى للسيولة بالدولار (يمكن خفضه/رفعه)
 WS_SUB_CHUNK=20
+ENABLE_MULTI_EXCHANGE=true
+SIGNAL_EXCHANGES=okx,binance,bybit
+EXTERNAL_SOURCES=spot,swap
+MX_DEBOUNCE_MS=500
 """
 
 import asyncio
@@ -77,8 +81,8 @@ OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 
 USE_DEMO = os.getenv("USE_DEMO", "true").lower() in ("1", "true", "yes")
 
-# ≥ 500k$ (قابلة للتعديل من .env)
-BIG_TRADE_USD = float(os.getenv("BIG_TRADE_USD", "500000"))
+# ≥ 1M$ (قابلة للتعديل من .env)
+BIG_TRADE_USD = float(os.getenv("BIG_TRADE_USD", "1000000"))
 
 # دخول ثابت: 100$ مارجن × 10 = 1000$ قيمة اسمية
 MARGIN_PER_TRADE_USD = float(os.getenv("MARGIN_PER_TRADE_USD", "100"))
@@ -103,6 +107,12 @@ TRANSFERS_EXCHANGES = [s.strip().lower() for s in os.getenv("TRANSFERS_EXCHANGES
 TRANSFERS_PROVIDER = os.getenv("TRANSFERS_PROVIDER", "whalealert").lower()
 WHALE_ALERT_API_KEY = os.getenv("WHALE_ALERT_API_KEY", "")
 TRANSFERS_EXCHANGES_SET = set(TRANSFERS_EXCHANGES)
+
+# إشارات متعددة المنصات
+ENABLE_MULTI_EXCHANGE = os.getenv("ENABLE_MULTI_EXCHANGE", "false").lower() in ("1", "true", "yes")
+SIGNAL_EXCHANGES = [s.strip().lower() for s in os.getenv("SIGNAL_EXCHANGES", "okx").split(",") if s.strip()]
+EXTERNAL_SOURCES = [s.strip().lower() for s in os.getenv("EXTERNAL_SOURCES", "spot,swap").split(",") if s.strip()]
+MX_DEBOUNCE_MS = int(os.getenv("MX_DEBOUNCE_MS", "500"))
 
 # downsizing
 ALLOW_AUTO_DOWNSIZE = os.getenv("ALLOW_AUTO_DOWNSIZE", "true").lower() in ("1", "true", "yes")
@@ -159,6 +169,18 @@ class TransferEvent:
     src: str
     dst: str
 
+
+@dataclass
+class TradeEvent:
+    exchange: str
+    market_type: str  # "spot" أو "swap"
+    base: str
+    side: str  # "buy" أو "sell"
+    px: float
+    sz: float
+    notional_usd: float
+    ts: int
+
 class State:
     def __init__(self):
         self.position: Optional[Position] = None
@@ -177,6 +199,7 @@ class State:
         self.swap_map: Dict[str, str] = {}    # base -> swap instId
         self.last_signal_ts_by_inst: Dict[str, int] = {}
         self.effective_leverage_by_symbol: Dict[str, int] = {}
+        self.mx_buffers: Dict[Tuple[str, str], dict] = {}
 
 state = State()
 
@@ -439,6 +462,56 @@ def round_contracts(inst_id: str, contracts: float) -> float:
     amount_min = mk.get("amount_min", 1)
     return contracts if contracts >= amount_min else 0.0
 
+
+async def handle_trade_event(ev: TradeEvent):
+    key = (ev.base, ev.side)
+    buf = state.mx_buffers.get(key)
+    if not buf:
+        buf = {"notional": 0.0, "sources": set(), "px": ev.px, "sz": ev.sz, "ts": ev.ts}
+        state.mx_buffers[key] = buf
+        asyncio.create_task(flush_mx_buffer(ev.base, ev.side))
+    buf["notional"] += ev.notional_usd
+    buf["sources"].add(f"{ev.exchange.upper()}-{ev.market_type.upper()}")
+    buf["px"] = ev.px
+    buf["sz"] = ev.sz
+    buf["ts"] = ev.ts
+
+
+async def flush_mx_buffer(base: str, side: str):
+    await asyncio.sleep(MX_DEBOUNCE_MS / 1000.0)
+    buf = state.mx_buffers.pop((base, side), None)
+    if not buf:
+        return
+    total = buf.get("notional", 0.0)
+    if total < BIG_TRADE_USD:
+        return
+    target_inst = state.swap_map.get(base)
+    if not target_inst:
+        return
+    sources = list(buf.get("sources", []))
+    src_label = (
+        f"MULTI (Σ عبر {MX_DEBOUNCE_MS}ms)" if len(sources) > 1 else (sources[0] if sources else "UNKNOWN")
+    )
+    trigger = {
+        "side": side,
+        "px": buf.get("px"),
+        "sz": buf.get("sz"),
+        "notional": total,
+        "ts": buf.get("ts"),
+        "source": src_label,
+    }
+    signal_side = "long" if side == "buy" else "short"
+    if state.position is None:
+        eff_lev = get_effective_leverage(state.mk[target_inst]["symbol"])
+        notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
+        await open_position(target_inst, signal_side, notional_to_use, trigger)
+    else:
+        if FLIP_ALLOWED and state.position.inst_id == target_inst and signal_side != state.position.side:
+            await close_position("flip")
+            eff_lev = get_effective_leverage(state.mk[target_inst]["symbol"])
+            notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
+            await open_position(target_inst, signal_side, notional_to_use, trigger)
+
 # ==========================
 # أوامر ومراكز (محمية بالقفل)
 # ==========================
@@ -525,9 +598,9 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         t_ts = trigger.get('ts')
         src = trigger.get('source', 'SWAP')
         reason_ar = (
-            "السبب: دخول مستثمر/متداول بشراء ≥ 500,000$."
+            f"السبب: دخول مستثمر/متداول بشراء ≥ {BIG_TRADE_USD:,.0f}$."
             if trigger.get('side') == 'buy'
-            else "السبب: خروج/بيع ≥ 500,000$ من السوق."
+            else f"السبب: خروج/بيع ≥ {BIG_TRADE_USD:,.0f}$ من السوق."
         )
         if src.upper() == 'TRANSFER':
             direction = trigger.get('dir', '')
@@ -546,7 +619,7 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
             t_sz = trigger.get('sz')
             trigger_text = (
                 "📣 *Signal*\n"
-                f"مصدر الإشارة: {src.upper()}\n"
+                f"مصدر الإشارة: {src}\n"
                 f"{reason_ar}\n"
                 f"• Cause: Aggressive {t_side} ≥ ${BIG_TRADE_USD:,}\n"
                 f"• Observed: {t_side} sz={t_sz} @ {t_px} → notional ≈ ${t_notional:,.0f}\n"
@@ -734,6 +807,126 @@ async def transfers_listener():
             logger.error(f"Transfers poller error: {e}")
         await asyncio.sleep(TRANSFERS_POLL_SEC)
 
+
+# ==========================
+# إشارات متعددة المنصات
+# ==========================
+
+def _ext_symbols_for_exchange(exchange_name: str) -> List[str]:
+    bases = list(state.swap_map.keys())
+    if exchange_name == "binance":
+        return [f"{b.lower()}usdt" for b in bases]
+    if exchange_name == "bybit":
+        return [f"{b.upper()}USDT" for b in bases]
+    return []
+
+
+async def binance_ws(market_type: str):
+    syms = _ext_symbols_for_exchange("binance")
+    if not syms:
+        return
+    stream = "/".join(f"{s}@trade" for s in syms)
+    url = (
+        "wss://stream.binance.com:9443/stream?streams="
+        if market_type == "spot"
+        else "wss://fstream.binance.com/stream?streams="
+    ) + stream
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                logger.info(f"Connected Binance {market_type} WS")
+                async for msg in ws:
+                    obj = json.loads(msg)
+                    data = obj.get("data")
+                    if not data:
+                        continue
+                    px = float(data.get("p", 0) or 0)
+                    qty = float(data.get("q", 0) or 0)
+                    ts = int(data.get("T", 0) or 0)
+                    if px <= 0 or qty <= 0:
+                        continue
+                    side = "sell" if data.get("m") else "buy"
+                    symbol = (data.get("s") or obj.get("stream", "").split("@")[0]).upper()
+                    base = symbol.replace("USDT", "")
+                    await handle_trade_event(
+                        TradeEvent(
+                            exchange="binance",
+                            market_type=market_type,
+                            base=base,
+                            side=side,
+                            px=px,
+                            sz=qty,
+                            notional_usd=px * qty,
+                            ts=ts,
+                        )
+                    )
+        except Exception as e:
+            logger.error(f"Binance {market_type} WS error: {e}")
+            await asyncio.sleep(1)
+
+
+async def bybit_ws(market_type: str):
+    syms = _ext_symbols_for_exchange("bybit")
+    if not syms:
+        return
+    endpoint = (
+        "wss://stream.bybit.com/v5/public/spot"
+        if market_type == "spot"
+        else "wss://stream.bybit.com/v5/public/linear"
+    )
+    args = [f"publicTrade.{s}" for s in syms]
+    sub = json.dumps({"op": "subscribe", "args": args})
+    while True:
+        try:
+            async with websockets.connect(endpoint, ping_interval=20, ping_timeout=20) as ws:
+                await ws.send(sub)
+                logger.info(f"Connected Bybit {market_type} WS")
+                async for msg in ws:
+                    obj = json.loads(msg)
+                    topic = obj.get("topic", "")
+                    if not topic.startswith("publicTrade"):
+                        continue
+                    symbol = topic.split(".")[1].upper()
+                    base = symbol.replace("USDT", "")
+                    for t in obj.get("data", []):
+                        px = float(t.get("p", 0) or 0)
+                        qty = float(t.get("v", 0) or 0)
+                        ts = int(t.get("T") or t.get("t") or 0)
+                        side = str(t.get("S", "")).lower()
+                        if px <= 0 or qty <= 0 or side not in ("buy", "sell"):
+                            continue
+                        await handle_trade_event(
+                            TradeEvent(
+                                exchange="bybit",
+                                market_type=market_type,
+                                base=base,
+                                side=side,
+                                px=px,
+                                sz=qty,
+                                notional_usd=px * qty,
+                                ts=ts,
+                            )
+                        )
+        except Exception as e:
+            logger.error(f"Bybit {market_type} WS error: {e}")
+            await asyncio.sleep(1)
+
+
+async def multi_exchange_listener():
+    tasks = []
+    if "binance" in SIGNAL_EXCHANGES:
+        if "spot" in EXTERNAL_SOURCES:
+            tasks.append(asyncio.create_task(binance_ws("spot")))
+        if "swap" in EXTERNAL_SOURCES:
+            tasks.append(asyncio.create_task(binance_ws("swap")))
+    if "bybit" in SIGNAL_EXCHANGES:
+        if "spot" in EXTERNAL_SOURCES:
+            tasks.append(asyncio.create_task(bybit_ws("spot")))
+        if "swap" in EXTERNAL_SOURCES:
+            tasks.append(asyncio.create_task(bybit_ws("swap")))
+    if tasks:
+        await asyncio.gather(*tasks)
+
 # ==========================
 # WebSocket للـ Bottom-N
 # ==========================
@@ -874,6 +1067,8 @@ async def main():
     ]
     if ENABLE_TRANSFERS and "transfers" in SIGNAL_SOURCES:
         tasks.append(asyncio.create_task(transfers_listener()))
+    if ENABLE_MULTI_EXCHANGE:
+        tasks.append(asyncio.create_task(multi_exchange_listener()))
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
