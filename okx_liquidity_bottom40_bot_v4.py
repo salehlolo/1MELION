@@ -5,7 +5,7 @@
 - معيار الاختيار: أصغر *quoteVolume* بالدولار (أو baseVolume*last كfallback) مع حد أدنى سيولة لضمان أنها "فيها سيولة".
 - الدخول **فوري** عند تنفيذ Aggressive بقيمة **≥ 500,000$** (قابلة للتغيير).
 - حجم الدخول ثابت: **100$ مارجن × 10x = 1000$** اسمي لكل صفقة. صفقة واحدة فقط + Flip على نفس الأداة.
-- الهدف/الوقف: **±2%** من سعر الدخول.
+- الهدف/الوقف: **صافي ±2%** من سعر الدخول بعد الرسوم والانزلاق.
 - تيليجرام منظم: رسالة بدء، رسالة فتح تجمع سبب الإشارة + تفاصيل التنفيذ، تقرير كل ساعة، رسالة إغلاق بنتيجة الربح/الخسارة.
 - تحسينات: قفل تزامني لمنع السباقات، اشتراكات WS على دفعات، وضبط رافعة مع backoff.
 
@@ -29,9 +29,12 @@ BIG_TRADE_USD=500000
 MARGIN_PER_TRADE_USD=100
 LEVERAGE=10
 
-# TP/SL
-STOP_LOSS_BPS=200
-TAKE_PROFIT_BPS=200
+# TP/SL (net after fees & slippage)
+TAKE_PROFIT_NET_BPS=200
+STOP_LOSS_NET_BPS=200
+TAKER_FEE_BPS_PER_SIDE=5
+SLIPPAGE_BPS_ENTRY=2
+SLIPPAGE_BPS_EXIT=2
 
 # سلوك الدخول
 COOLDOWN_BETWEEN_TRADES_SEC=0
@@ -81,9 +84,12 @@ BIG_TRADE_USD = float(os.getenv("BIG_TRADE_USD", "500000"))
 MARGIN_PER_TRADE_USD = float(os.getenv("MARGIN_PER_TRADE_USD", "100"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-# الهدف/الوقف = 2%
-STOP_LOSS_BPS = int(os.getenv("STOP_LOSS_BPS", "200"))       # 2.00%
-TAKE_PROFIT_BPS = int(os.getenv("TAKE_PROFIT_BPS", "200"))   # 2.00%
+# الهدف/الوقف (صافي بعد الرسوم والانزلاق)
+TAKE_PROFIT_NET_BPS = int(os.getenv("TAKE_PROFIT_NET_BPS", "200"))   # 2.00% net
+STOP_LOSS_NET_BPS = int(os.getenv("STOP_LOSS_NET_BPS", "200"))       # 2.00% net
+TAKER_FEE_BPS_PER_SIDE = float(os.getenv("TAKER_FEE_BPS_PER_SIDE", "5"))
+SLIPPAGE_BPS_ENTRY = float(os.getenv("SLIPPAGE_BPS_ENTRY", "2"))
+SLIPPAGE_BPS_EXIT = float(os.getenv("SLIPPAGE_BPS_EXIT", "2"))
 
 # فوري: لا تأخير بين الصفقات (لكن نمنع فتح أكثر من صفقة في آن واحد)
 COOLDOWN_BETWEEN_TRADES_SEC = int(os.getenv("COOLDOWN_BETWEEN_TRADES_SEC", "0"))
@@ -123,6 +129,8 @@ class Position:
     entry_price: float
     contracts: float
     notional: float
+    tp_price: float
+    sl_price: float
 
 class State:
     def __init__(self):
@@ -304,6 +312,29 @@ def notional_to_contracts(inst_id: str, notional_usd: float, price: float) -> fl
     cs = float(mk["contractSize"]) or 1.0
     return max(notional_usd / (price * cs), 0.0)
 
+
+def compute_tp_sl_prices(entry_price: float, side: str) -> Tuple[float, float]:
+    d_tp = TAKE_PROFIT_NET_BPS / 10_000
+    d_sl = STOP_LOSS_NET_BPS / 10_000
+    fee_in = TAKER_FEE_BPS_PER_SIDE / 10_000
+    fee_out = TAKER_FEE_BPS_PER_SIDE / 10_000
+    slip_in = SLIPPAGE_BPS_ENTRY / 10_000
+    slip_out = SLIPPAGE_BPS_EXIT / 10_000
+    c_in = fee_in + slip_in
+    c_out = fee_out + slip_out
+
+    if side == "long":
+        a = (d_tp + c_in + c_out) / (1 - c_out)
+        b = 1 - (1 + c_in - d_sl) / (1 - c_out)
+        tp = entry_price * (1 + a)
+        sl = entry_price * (1 - b)
+    else:
+        g = (d_tp + c_in + c_out) / (1 + c_out)
+        u = (d_sl + c_in + c_out) / (1 + c_out)
+        tp = entry_price * (1 - g)
+        sl = entry_price * (1 + u)
+    return tp, sl
+
 def round_contracts(inst_id: str, contracts: float) -> float:
     mk = state.mk.get(inst_id, {})
     amt_prec = mk.get("amount_precision")
@@ -348,7 +379,8 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         logger.info(f"Opening {side.upper()} {inst_id} | notional ≈ ${notional_usd:,.0f} | contracts ≈ {contracts} @ ~{price}")
         await asyncio.to_thread(exchange.create_order, symbol, "market", ccxt_side, contracts, None, params)
 
-        state.position = Position(inst_id=inst_id, symbol=symbol, side=side, entry_price=price, contracts=contracts, notional=notional_usd)
+        tp_price, sl_price = compute_tp_sl_prices(price, side)
+        state.position = Position(inst_id=inst_id, symbol=symbol, side=side, entry_price=price, contracts=contracts, notional=notional_usd, tp_price=tp_price, sl_price=sl_price)
         state.last_trade_ts = time.time()
         state.total_trades += 1
 
@@ -360,8 +392,12 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         t_px = trigger.get('px')
         t_sz = trigger.get('sz')
         t_ts = trigger.get('ts')
+        reason_ar = (
+            "السبب: دخول مستثمر/متداول بشراء ≥ 500,000$" if trigger.get('side') == 'buy' else "السبب: خروج/بيع ≥ 500,000$ من السوق"
+        )
         trigger_text = (
             "📣 *Signal*\n"
+            f"{reason_ar}\n"
             f"• Cause: Aggressive {t_side} ≥ ${BIG_TRADE_USD:,}\n"
             f"• Observed: {t_side} sz={t_sz} @ {t_px} → notional ≈ ${t_notional:,.0f}\n"
             f"• Time: {t_ts}"
@@ -372,7 +408,7 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         f"• Entry: {state.position.entry_price if state.position else price}\n"
         f"• Notional used: ~${notional_usd:,.0f} (margin ${MARGIN_PER_TRADE_USD} x{LEVERAGE})\n"
         f"• Contracts: {state.position.contracts if state.position else contracts}\n"
-        f"• Protections: TP +{TAKE_PROFIT_BPS/100:.2f}%, SL -{STOP_LOSS_BPS/100:.2f}%\n"
+        f"• Protections: TP +{TAKE_PROFIT_NET_BPS/100:.2f}% (net), SL -{STOP_LOSS_NET_BPS/100:.2f}% (net)\n"
         f"• Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"
     )
     await tg_send((trigger_text + "\n\n" + exec_text) if trigger_text else exec_text)
@@ -433,13 +469,16 @@ async def manage_risk_loop():
             if state.position:
                 pos = state.position
                 price_now = await fetch_price(pos.symbol)
-                change_bps = (price_now - pos.entry_price) / pos.entry_price * 10_000
-                change_bps = change_bps if pos.side == "long" else -change_bps
-
-                if change_bps <= -STOP_LOSS_BPS:
-                    await close_position("stop loss")
-                elif change_bps >= TAKE_PROFIT_BPS:
-                    await close_position("take profit")
+                if pos.side == "long":
+                    if price_now <= pos.sl_price:
+                        await close_position("stop loss")
+                    elif price_now >= pos.tp_price:
+                        await close_position("take profit")
+                else:
+                    if price_now >= pos.sl_price:
+                        await close_position("stop loss")
+                    elif price_now <= pos.tp_price:
+                        await close_position("take profit")
 
             await asyncio.sleep(TICKER_POLL_SEC)
         except Exception as e:
@@ -593,7 +632,7 @@ async def main():
         f"• Min quote vol: ${int(MIN_QUOTE_VOL_USD):,}\n"
         f"• Entry per trade: ${MARGIN_PER_TRADE_USD} x{LEVERAGE} = ${int(MARGIN_PER_TRADE_USD*LEVERAGE)} notional\n"
         f"• Signal threshold: ≥ ${int(BIG_TRADE_USD):,}\n"
-        f"• TP/SL: ±{TAKE_PROFIT_BPS/100:.2f}%\n"
+        f"• TP/SL: ±{TAKE_PROFIT_NET_BPS/100:.2f}% net\n"
         f"• Flip: {'Enabled' if FLIP_ALLOWED else 'Disabled'}\n"
         f"• Examples: {listed}\n"
         f"• Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"
