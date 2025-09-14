@@ -91,6 +91,10 @@ TAKER_FEE_BPS_PER_SIDE = float(os.getenv("TAKER_FEE_BPS_PER_SIDE", "5"))
 SLIPPAGE_BPS_ENTRY = float(os.getenv("SLIPPAGE_BPS_ENTRY", "2"))
 SLIPPAGE_BPS_EXIT = float(os.getenv("SLIPPAGE_BPS_EXIT", "2"))
 
+# downsizing
+ALLOW_AUTO_DOWNSIZE = os.getenv("ALLOW_AUTO_DOWNSIZE", "true").lower() in ("1", "true", "yes")
+MARGIN_SAFETY_FACTOR = float(os.getenv("MARGIN_SAFETY_FACTOR", "1.05"))
+
 # فوري: لا تأخير بين الصفقات (لكن نمنع فتح أكثر من صفقة في آن واحد)
 COOLDOWN_BETWEEN_TRADES_SEC = int(os.getenv("COOLDOWN_BETWEEN_TRADES_SEC", "0"))
 
@@ -146,6 +150,7 @@ class State:
         self.mk: Dict[str, dict] = {}
         self.watch_insts: List[str] = []
         self.last_signal_ts_by_inst: Dict[str, int] = {}
+        self.effective_leverage_by_symbol: Dict[str, int] = {}
 
 state = State()
 
@@ -285,7 +290,8 @@ async def set_leverage_with_backoff(symbol: str, leverage: int):
         try:
             await asyncio.to_thread(exchange.set_leverage, leverage, symbol, {"mgnMode": "cross"})
             logger.info(f"Leverage set to {leverage}x for {symbol}")
-            return
+            state.effective_leverage_by_symbol[symbol] = leverage
+            return leverage
         except Exception as e:
             s = str(e)
             if "50011" in s or "Too Many Requests" in s:
@@ -294,7 +300,7 @@ async def set_leverage_with_backoff(symbol: str, leverage: int):
                 delay = min(delay * 2, 4.0)
                 continue
             logger.warning(f"Couldn't set leverage via API for {symbol}: {e}")
-            return
+            return None
 
 async def fetch_price(symbol: str) -> float:
     ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
@@ -304,6 +310,12 @@ async def fetch_equity_usdt() -> float:
     bal = await asyncio.to_thread(exchange.fetch_balance)
     usdt = bal.get("USDT") or {}
     return float(usdt.get("total") or usdt.get("free") or 0.0)
+
+def get_effective_leverage(symbol: str) -> int:
+    lev = state.effective_leverage_by_symbol.get(symbol)
+    if lev is None or lev <= 0:
+        return max(1, LEVERAGE)
+    return max(1, lev)
 
 def notional_to_contracts(inst_id: str, notional_usd: float, price: float) -> float:
     mk = state.mk.get(inst_id)
@@ -364,23 +376,63 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
             return
 
         symbol = mk["symbol"]
+        eff_lev = get_effective_leverage(symbol)
         price = await fetch_price(symbol)
         if price <= 0:
             return
 
+        initial_margin_needed = notional_usd / eff_lev
+        equity = await fetch_equity_usdt()
+        if equity < initial_margin_needed * MARGIN_SAFETY_FACTOR:
+            warn = f"⚠️ *Skipped signal* — Equity too low. Need ~${initial_margin_needed:,.0f}, have ~${equity:,.0f}."
+            logger.warning(warn)
+            await tg_send(warn)
+            return
+
         contracts = round_contracts(inst_id, notional_to_contracts(inst_id, notional_usd, price))
         if contracts <= 0:
+            warn = "⚠️ *Skipped signal* — Min notional exceeds budget."
             logger.warning("Calculated contracts <= 0; aborting open_position")
+            await tg_send(warn)
             return
 
         ccxt_side = "buy" if side == "long" else "sell"
         params = {"tdMode": "cross"}
 
-        logger.info(f"Opening {side.upper()} {inst_id} | notional ≈ ${notional_usd:,.0f} | contracts ≈ {contracts} @ ~{price}")
-        await asyncio.to_thread(exchange.create_order, symbol, "market", ccxt_side, contracts, None, params)
+        logger.info(
+            f"Opening {side.upper()} {inst_id} | notional ≈ ${notional_usd:,.0f} | contracts ≈ {contracts} @ ~{price}"
+        )
+        try:
+            await asyncio.to_thread(exchange.create_order, symbol, "market", ccxt_side, contracts, None, params)
+        except Exception as e:
+            if "51008" in str(e) and ALLOW_AUTO_DOWNSIZE:
+                equity = await fetch_equity_usdt()
+                max_notional = equity / MARGIN_SAFETY_FACTOR * eff_lev
+                new_contracts = round_contracts(inst_id, notional_to_contracts(inst_id, max_notional, price))
+                if new_contracts > 0:
+                    await asyncio.to_thread(exchange.create_order, symbol, "market", ccxt_side, new_contracts, None, params)
+                    contracts = new_contracts
+                    notional_usd = price * new_contracts * float(mk.get("contractSize", 1.0))
+                    initial_margin_needed = notional_usd / eff_lev
+                else:
+                    warn = "⚠️ *Skipped signal* — Equity too low even after downsizing."
+                    logger.warning(warn)
+                    await tg_send(warn)
+                    return
+            else:
+                raise
 
         tp_price, sl_price = compute_tp_sl_prices(price, side)
-        state.position = Position(inst_id=inst_id, symbol=symbol, side=side, entry_price=price, contracts=contracts, notional=notional_usd, tp_price=tp_price, sl_price=sl_price)
+        state.position = Position(
+            inst_id=inst_id,
+            symbol=symbol,
+            side=side,
+            entry_price=price,
+            contracts=contracts,
+            notional=notional_usd,
+            tp_price=tp_price,
+            sl_price=sl_price,
+        )
         state.last_trade_ts = time.time()
         state.total_trades += 1
 
@@ -393,7 +445,9 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
         t_sz = trigger.get('sz')
         t_ts = trigger.get('ts')
         reason_ar = (
-            "السبب: دخول مستثمر/متداول بشراء ≥ 500,000$" if trigger.get('side') == 'buy' else "السبب: خروج/بيع ≥ 500,000$ من السوق"
+            "السبب: دخول مستثمر/متداول بشراء ≥ 500,000$."
+            if trigger.get('side') == 'buy'
+            else "السبب: خروج/بيع ≥ 500,000$ من السوق."
         )
         trigger_text = (
             "📣 *Signal*\n"
@@ -406,7 +460,7 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
     exec_text = (
         f"🟢 *Opened {side.upper()}* `{inst_id}`\n"
         f"• Entry: {state.position.entry_price if state.position else price}\n"
-        f"• Notional used: ~${notional_usd:,.0f} (margin ${MARGIN_PER_TRADE_USD} x{LEVERAGE})\n"
+        f"• Notional used: ~${notional_usd:,.0f} (margin ${MARGIN_PER_TRADE_USD} x{eff_lev})\n"
         f"• Contracts: {state.position.contracts if state.position else contracts}\n"
         f"• Protections: TP +{TAKE_PROFIT_NET_BPS/100:.2f}% (net), SL -{STOP_LOSS_NET_BPS/100:.2f}% (net)\n"
         f"• Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"
@@ -588,12 +642,14 @@ async def trades_listener():
                         trigger = {"side": side, "px": px, "sz": sz, "notional": notional, "ts": ts}
 
                         if state.position is None:
-                            notional_to_use = MARGIN_PER_TRADE_USD * LEVERAGE
+                            eff_lev = get_effective_leverage(state.mk[inst]["symbol"])
+                            notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
                             await open_position(inst, signal_side, notional_to_use, trigger)
                         else:
                             if FLIP_ALLOWED and state.position.inst_id == inst and signal_side != state.position.side:
                                 await close_position("flip")
-                                notional_to_use = MARGIN_PER_TRADE_USD * LEVERAGE
+                                eff_lev = get_effective_leverage(state.mk[inst]["symbol"])
+                                notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
                                 await open_position(inst, signal_side, notional_to_use, trigger)
         except Exception as e:
             logger.error(f"WS error: {e}. Reconnecting in 0.6s…")
