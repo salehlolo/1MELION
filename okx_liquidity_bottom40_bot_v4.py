@@ -56,6 +56,8 @@ import math
 import os
 import time
 import logging
+import random
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
@@ -168,6 +170,7 @@ class TransferEvent:
     ts: int
     src: str
     dst: str
+    chain: str
 
 
 @dataclass
@@ -264,15 +267,62 @@ class WhaleAlertPoller:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.cursor: Optional[str] = None
+        self.last_call: float = 0.0
+        self.call_times: deque[float] = deque()
+        self.rate429: int = 15
 
-    async def fetch_recent_transfers(self, since_ts: int) -> List[TransferEvent]:
+    async def _throttle(self):
+        min_interval = 6.0
+        now = time.time()
+        # ensure at least 6s between calls
+        elapsed = now - self.last_call
+        if elapsed < min_interval:
+            await asyncio.sleep(min_interval - elapsed)
+            now = time.time()
+        # ensure no more than 10 calls per minute
+        while self.call_times and now - self.call_times[0] > 60:
+            self.call_times.popleft()
+        if len(self.call_times) >= 10:
+            wait = 60 - (now - self.call_times[0])
+            await asyncio.sleep(max(wait, 0))
+            now = time.time()
+            while self.call_times and now - self.call_times[0] > 60:
+                self.call_times.popleft()
+        self.last_call = now
+        self.call_times.append(now)
+
+    async def fetch_recent_transfers(self, since_ts: Optional[int] = None) -> List[TransferEvent]:
         if not self.api_key:
             logger.warning("WhaleAlert API key missing; returning no transfers")
             return []
-        params = {"api_key": self.api_key, "start": since_ts}
+
+        await self._throttle()
+
+        params = {
+            "api_key": self.api_key,
+            "start": int(time.time()) - 90,
+            "min_value": int(TRANSFERS_MIN_USD),
+            "limit": 100,
+        }
+        if self.cursor:
+            params["cursor"] = self.cursor
         try:
             resp = await asyncio.to_thread(requests.get, self.BASE_URL, params=params, timeout=10)
-            data = resp.json()
+        except Exception as e:
+            delay = random.randint(10, 30)
+            logger.warning(f"WhaleAlert fetch failed: {e}; retrying in {delay}s")
+            await asyncio.sleep(delay)
+            return []
+
+        status = resp.status_code
+        if status == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning("WhaleAlert invalid JSON")
+                return []
+            self.cursor = data.get("cursor") or self.cursor
             events: List[TransferEvent] = []
             for tx in data.get("transactions", []):
                 try:
@@ -284,13 +334,30 @@ class WhaleAlertPoller:
                             ts=int(tx.get("timestamp") or 0),
                             src=(tx.get("from", {}) or {}).get("owner", "").lower(),
                             dst=(tx.get("to", {}) or {}).get("owner", "").lower(),
+                            chain=(tx.get("blockchain") or "").lower(),
                         )
                     )
                 except Exception:
                     continue
             return events
-        except Exception as e:
-            logger.warning(f"WhaleAlert fetch failed: {e}")
+        elif status in (401, 403):
+            logger.warning("WhaleAlert auth error")
+            await asyncio.sleep(60)
+            return []
+        elif status == 429:
+            retry_after = int(resp.headers.get("Retry-After", 0) or 0)
+            wait = max(retry_after, self.rate429)
+            logger.warning(f"WhaleAlert rate limited; retrying in {wait}s")
+            await asyncio.sleep(wait)
+            self.rate429 = min(self.rate429 * 2, 60)
+            return []
+        elif 500 <= status < 600:
+            delay = random.randint(10, 30)
+            logger.warning(f"WhaleAlert server error {status}; retrying in {delay}s")
+            await asyncio.sleep(delay)
+            return []
+        else:
+            logger.warning(f"WhaleAlert unexpected status {status}")
             return []
 
 async def build_universe_bottomN() -> Tuple[List[Tuple[str, str, float]], List[Tuple[str, str, float]]]:
@@ -606,11 +673,15 @@ async def open_position(inst_id: str, side: str, notional_usd: float, trigger: d
             direction = trigger.get('dir', '')
             usd_val = trigger.get('usd', 0)
             exch = trigger.get('exchange', '')
+            base = trigger.get('base', '')
+            chain = trigger.get('chain', '')
+            t_fmt = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_ts)) if t_ts else ''
             trigger_text = (
                 "📣 *Signal*\n"
-                f"مصدر الإشارة: TRANSFER ({direction}) {exch} ~${usd_val:,.0f}\n"
+                f"السبب: (WhaleAlert) {direction} {exch}\n"
                 f"{reason_ar}\n"
-                f"• Time: {t_ts}"
+                f"• Transfer: ~${usd_val:,.0f} {base} on {chain}\n"
+                f"• Time: {t_fmt} UTC"
             )
         else:
             t_side = 'BUY' if trigger.get('side') == 'buy' else 'SELL'
@@ -749,15 +820,14 @@ async def hourly_report_loop():
 
 async def transfers_listener():
     poller = WhaleAlertPoller(WHALE_ALERT_API_KEY)
-    since = int(time.time()) - 60
     seen: Dict[str, float] = {}
+    poll_interval = max(6.0, TRANSFERS_POLL_SEC)
     while True:
         try:
-            events = await poller.fetch_recent_transfers(since)
-            since = int(time.time()) - 60
+            events = await poller.fetch_recent_transfers()
             now = time.time()
             for k, v in list(seen.items()):
-                if now - v > 60:
+                if now - v > 300:
                     del seen[k]
             for ev in events:
                 if ev.id in seen:
@@ -769,10 +839,10 @@ async def transfers_listener():
                 direction = None
                 exchange_name = None
                 if ev.dst in TRANSFERS_EXCHANGES_SET:
-                    direction = "inflow"
+                    direction = "in"
                     exchange_name = ev.dst
                 elif ev.src in TRANSFERS_EXCHANGES_SET:
-                    direction = "outflow"
+                    direction = "out"
                     exchange_name = ev.src
                 if not direction:
                     continue
@@ -786,7 +856,7 @@ async def transfers_listener():
                     continue
                 if ts_int:
                     state.last_signal_ts_by_inst[inst_id] = ts_int
-                side = "short" if direction == "inflow" else "long"
+                side = "long" if direction == "in" else "short"
                 eff_lev = get_effective_leverage(state.mk[inst_id]["symbol"])
                 notional_to_use = MARGIN_PER_TRADE_USD * eff_lev
                 trigger = {
@@ -795,7 +865,9 @@ async def transfers_listener():
                     "usd": usd,
                     "ts": ev.ts,
                     "exchange": exchange_name,
-                    "side": "sell" if side == "short" else "buy",
+                    "base": base,
+                    "chain": ev.chain,
+                    "side": "buy" if side == "long" else "sell",
                 }
                 if state.position is None:
                     await open_position(inst_id, side, notional_to_use, trigger)
@@ -805,7 +877,7 @@ async def transfers_listener():
                         await open_position(inst_id, side, notional_to_use, trigger)
         except Exception as e:
             logger.error(f"Transfers poller error: {e}")
-        await asyncio.sleep(TRANSFERS_POLL_SEC)
+        await asyncio.sleep(poll_interval)
 
 
 # ==========================
